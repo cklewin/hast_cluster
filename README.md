@@ -25,7 +25,6 @@ hast_cluster master	- switch to master mode
 example:
 ```
 (pending)
-
 ```
 
 ### Add a sensor for carp failover to devd 
