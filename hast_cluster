@@ -1,0 +1,251 @@
+#!/bin/sh
+#
+
+# PROVIDE: hast_cluster
+# REQUIRE: hastd
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="hast_cluster"
+rcvar=`set_rcvar`
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+slave_cmd="${name}_slave"
+master_cmd="${name}_master"
+extra_commands="slave master"
+
+load_rc_config ${name}
+
+hast_cluster_logger="/usr/bin/logger -t hast_cluster[$$] -p daemon.notice"
+
+hast_cluster_start()
+{
+	:
+}
+
+hast_cluster_stop()
+{
+	hast_cluster_slave
+}
+
+hast_cluster_slave()
+{
+	echo "Switching cluster node to slave for ${hast_cluster_resources}." | ${hast_cluster_logger}
+
+	out=`/etc/rc.d/hastd status >/dev/null 2>&1`
+	if [ $? -ne 0 ]; then
+		echo "hastd is not running"
+		echo "hastd is not running" | ${hast_cluster_logger}
+		exit 1
+	fi
+
+	# Check for any obvious issues with the resources
+	for resource in ${hast_cluster_resources}; do
+		# Is the resource ok?
+		hast_status=`hastctl status ${resource}`
+		if [ $? -ne 0 ]; then
+			echo "hastctl status ${resource}: ${hast_status}." | ${hast_cluster_logger}
+			continue
+		fi
+
+		# Are we already running hast as secondary?
+		out=`hastctl status ${resource} |grep -q "role: secondary"`
+		if [ $? -eq 0 ]; then
+			echo "Secondary process for resource ${resource} is already running." | ${hast_cluster_logger}
+			continue
+		fi
+
+		ok_resources="${ok_resources} ${resource}"
+	done
+
+	# DUPLICATED - need to break into a function for this
+	hast_cluster_resources=${ok_resources}
+	unset ok_resources
+	if [ ! "${hast_cluster_resources}" ]; then
+		exit 1
+	fi
+
+	# If all is good so far, let's stop NFS so our clients don't get confused
+	echo "Shutting down NFS." | ${hast_cluster_logger}
+
+	/etc/rc.d/nfsd stop
+	/etc/rc.d/mountd stop
+	/etc/rc.d/statd stop
+	/etc/rc.d/lockd stop
+	# END_DUPLICATED
+
+	# Wait 30 seconds for any pending ZFS updates to finish
+	echo "Waiting 30 seconds for pending ZFS updates to finish"
+	echo "Waiting 30 seconds for pending ZFS updates to finish" | ${hast_cluster_logger}
+	sleep 30;
+
+	for resource in ${hast_cluster_resources}; do
+		# Export zpool if it exists
+		out=`zpool status "${resource}" 2>&1`
+		if [ $? -eq 0 ]; then
+			echo "Exporting ZFS pool ${resource}" | ${hast_cluster_logger}
+			out=`zpool export "${resource}" 2>&1`
+			if [ $? -ne 0 ]; then
+				echo "ZFS pool export for resource ${resource} failed: ${out}" | ${hast_cluster_logger}
+				echo "Attempting to force export" | ${hast_cluster_logger}
+#				out=`zpool export -f "${resource}" 2>&1`
+#				if [ $? -ne 0 ]; then
+					echo "ZFS pool forced export for resource ${resource} failed: ${out}." | ${hast_cluster_logger}
+#					echo "Aborting node switch" | ${hast_cluster_logger}
+					exit
+#				fi
+			fi
+		fi
+
+		echo "Switching role to secondary for ${resource}" | ${hast_cluster_logger}
+
+		# Change role to secondary
+		out=`hastctl role secondary "${resource}" 2>&1`
+		if [ $? -ne 0 ]; then
+			echo "Unable to change role to secondary for resource ${resource}: ${out}." | ${hast_cluster_logger}
+			continue
+		fi
+
+		# Wait for the provider to be destroyed
+		for i in `jot 50`; do
+			[ ! -c "/dev/hast/${resource}" ] && break
+			sleep 0.1
+		done
+
+		if [ -c "/dev/hast/${resource}" ]; then
+			echo "Device /dev/hast/${resource} still exists." | ${hast_cluster_logger}
+			continue
+		fi
+
+		echo "Successfully switched to slave for resource ${resource}."
+		echo "Successfully switched to slave for resource ${resource}." | ${hast_cluster_logger}
+		ok_resources="${ok_resources} ${resource}"
+	done
+
+	# DUPLICATED - need to break into a function for this
+	hast_cluster_resources=${ok_resources}
+	unset ok_resources
+	if [ ! "${hast_cluster_resources}" ]; then
+		echo "No valid resources found to switch roles." | ${hast_cluster_logger}
+		exit 1
+	fi
+	# END_DUPLICATED
+}
+
+hast_cluster_master()
+{
+	echo "Switching cluster node to master for ${hast_cluster_resources}." | ${hast_cluster_logger}
+
+	out=`/etc/rc.d/hastd status >/dev/null 2>&1`
+	if [ $? -ne 0 ]; then
+		echo "hastd is not running"
+		echo "hastd is not running" | ${hast_cluster_logger}
+		exit 1
+	fi
+
+	# Make sure the default gateway is responsive, if that's down, then we don't want to switch the status to master
+	out=`/sbin/ping -qnot 5 ${defaultrouter}`;
+	if [ $? -ne 0 ]; then
+		echo "Default gateway ${defaultrouter} not responding, forcing carp0 down for 45 seconds"
+		echo "Default gateway ${defaultrouter} not responding, forcing carp0 down for 45 seconds" | ${hast_cluster_logger}
+		(ifconfig carp0 down; sleep 45; ifconfig carp0 up) &
+		exit 1
+	fi
+
+	for resource in ${hast_cluster_resources}; do
+		# Are we already running hast as primary?
+		out=`hastctl status ${resource} |grep -q "role: primary"`
+		if [ $? -eq 0 ]; then
+			echo "Primary process for resource ${resource} is already running." | ${hast_cluster_logger}
+			continue
+		fi
+
+		ok_resources="${ok_resources} ${resource}"
+	done
+
+	# DUPLICATED - need to break into a function for this
+	hast_cluster_resources=${ok_resources}
+	unset ok_resources
+	if [ ! "${hast_cluster_resources}" ]; then
+		exit 1
+	fi
+
+	# If all is good so far, let's stop NFS so our clients don't get confused
+	echo "Shutting down NFS." | ${hast_cluster_logger}
+	/etc/rc.d/nfsd stop
+	# END_DUPLICATED
+
+	for resource in ${hast_cluster_resources}; do
+
+		echo "Waiting up to 30 seconds for secondary process for resource ${resource} to stop." | ${hast_cluster_logger}
+		# Wait for the secondary process to stop - should be automatic if primary is offline
+		for i in `jot 30`; do
+			pgrep -f "hastd: ${resource} \(secondary\)" >/dev/null 2>&1 || break
+			sleep 1
+		done
+
+		echo "Switching role to primary for ${resource}" | ${hast_cluster_logger}
+
+		# Change role to primary
+		out=`hastctl role primary "${resource}" 2>&1`
+		if [ $? -ne 0 ]; then
+			echo "Unable to change role to primary for resource ${resource}: ${out}." | ${hast_cluster_logger}
+			continue
+		fi
+
+		# Fail out if the secondary process is still running
+		if pgrep -f "hastd: ${resource} \(secondary\)" >/dev/null 2>&1; then
+			echo "Secondary process for resource ${resource} is still running after 30 seconds." | ${hast_cluster_logger}
+			continue
+		fi
+
+		echo "Secondary process is not running." | ${hast_cluster_logger}
+
+		# Wait for the provider to appear
+		for i in `jot 50`; do
+			[ -c "/dev/hast/${resource}" ] && break
+			sleep 0.1
+		done
+
+		if [ ! -c "/dev/hast/${resource}" ]; then
+			echo "Device /dev/hast/${resource} doesn't exist." | ${hast_cluster_logger}
+			continue
+		fi
+
+		echo "Role for resource ${resource} changed to primary." | ${hast_cluster_logger}
+
+		# Import ZFS pool forcefully - the hostid will still be the other cluster node
+		out=`zpool import -f "${resource}" 2>&1`
+		if [ $? -ne 0 ]; then
+			echo "ZFS pool import for resource ${resource} failed: ${out}." | ${hast_cluster_logger}
+			continue
+		fi
+		echo "ZFS pool for resource ${resource} imported." | ${hast_cluster_logger}
+		ok_resources="${ok_resources} ${resource}"
+	done
+
+	# DUPLICATED - need to break into a function for this
+	hast_cluster_resources=${ok_resources}
+	unset ok_resources
+	if [ ! "${hast_cluster_resources}" ]; then
+		echo "No valid resources found to switch roles." | ${hast_cluster_logger}
+		exit 1
+	fi
+	# END_DUPLICATED
+
+	# Restart statd & lockd
+	/etc/rc.d/statd start
+	/etc/rc.d/lockd start
+
+	# Restart mountd
+	/etc/rc.d/mountd restart
+
+	# Start NFS server
+	/etc/rc.d/nfsd restart
+
+	echo "Successfully switched to master for resources ${hast_cluster_resources}."
+	echo "Successfully switched to master for resources ${hast_cluster_resources}." | ${hast_cluster_logger}
+}
+
+run_rc_command "$1"
